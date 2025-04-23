@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Defibrillator Pad Simulation (Remove Indicator)</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; background-color: #f0f0f0; }
+        canvas { display: block; }
+        #controls-container {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            z-index: 100;
+            pointer-events: none; /* Allow clicks to pass through container */
+        }
+        #info {
+            display: inline-block;
+            color: #333;
+            font-size: 16px;
+            background-color: rgba(255, 255, 255, 0.7);
+            padding: 10px 15px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            margin-bottom: 10px;
+            pointer-events: auto; /* Allow interaction with info if needed */
+        }
+         #restart-button {
+            display: none; /* Hidden initially */
+            margin-top: 5px; /* Adjusted margin */
+            padding: 8px 15px;
+            font-size: 14px;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            pointer-events: auto; /* Enable clicks on the button */
+            transition: background-color 0.3s ease;
+        }
+        #restart-button:hover {
+            background-color: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <div id="controls-container">
+        <div id="info">Step 1: Click on the 'skin' surface to choose placement location.</div>
+        <button id="restart-button">Restart</button>
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.9.1/gsap.min.js"></script>
+
+    <script>
+        // --- Basic Scene Setup ---
+        let scene, camera, renderer, controls;
+        let skinPlane, padMesh; // Removed indicatorMesh
+        let originalPadVertices = null;
+        const mouse = new THREE.Vector2();
+        const raycaster = new THREE.Raycaster();
+        let targetPosition = null;
+        let currentState = 'INITIAL'; // INITIAL, PLACING, PLACED, ROLLING, ROLLED
+        let dragStartPoint = null; // Stores {x, y} screen coordinates at drag start
+        let currentCurveFactor = 0;
+        let placedCurveFactor = 0; // Stores the curve factor when drag starts (should be 1)
+        const maxCurveHeight = 2.0;
+        const flattenThreshold = 0.01; // Curve factor must be below this to be considered flat
+
+        const infoElement = document.getElementById('info');
+        const restartButton = document.getElementById('restart-button');
+
+        // --- Constants ---
+        const padWidth = 5;
+        const padHeight = 7;
+        const padWidthSegments = 1;
+        const padHeightSegments = 20;
+        const skinTouchOffsetY = 0.05;
+        const estimatedRollDistance = window.innerHeight * 0.115; // Slower flattening rate
+        const rollSensitivity = 0.008;
+        const dragStartYThreshold = 0.1; // Bottom 10%
+
+
+        function init() {
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf0f0f0);
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 15, 20);
+            camera.lookAt(0, 0, 0);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // --- Controls ---
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.screenSpacePanning = false;
+            controls.minDistance = 5;
+            controls.maxDistance = 50;
+            controls.maxPolarAngle = Math.PI / 2 - 0.05;
+            controls.enabled = true; // Start enabled
+
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4); // Keep dimmer lights
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.7); // Keep dimmer lights
+            directionalLight.position.set(5, 15, 10);
+            directionalLight.castShadow = true;
+            scene.add(directionalLight);
+
+            // --- Create Objects ---
+            // Skin Plane
+            const skinGeometry = new THREE.PlaneGeometry(40, 40);
+            const skinMaterial = new THREE.MeshStandardMaterial({ color: 0xffdab9, side: THREE.DoubleSide, roughness: 0.9, metalness: 0.1 });
+            skinPlane = new THREE.Mesh(skinGeometry, skinMaterial);
+            skinPlane.rotation.x = -Math.PI / 2;
+            skinPlane.position.y = 0;
+            skinPlane.receiveShadow = true;
+            scene.add(skinPlane);
+
+            // Defibrillator Pad
+            const padGeometry = new THREE.PlaneGeometry(padWidth, padHeight, padWidthSegments, padHeightSegments);
+            const padMaterial = new THREE.MeshStandardMaterial({ color: 0xadd8e6, side: THREE.DoubleSide, transparent: true, opacity: 0.95, roughness: 0.9, metalness: 0.05 });
+            padMesh = new THREE.Mesh(padGeometry, padMaterial);
+            padMesh.position.set(0, 10, 0); // Start high
+            padMesh.rotation.x = -Math.PI / 2;
+            padMesh.castShadow = true;
+            scene.add(padMesh);
+
+            // --- Indicator Mesh Removed ---
+
+            // Store original vertices
+            originalPadVertices = Float32Array.from(padGeometry.attributes.position.array);
+
+            // --- Event Listeners ---
+            window.addEventListener('resize', onWindowResize, false);
+            renderer.domElement.addEventListener('click', onClick, false);
+            // Use CAPTURE phase for mousedown/touchstart
+            renderer.domElement.addEventListener('mousedown', onMouseDown, true);
+            renderer.domElement.addEventListener('mousemove', onMouseMove, false);
+            renderer.domElement.addEventListener('mouseup', onMouseUp, false);
+            renderer.domElement.addEventListener('touchstart', onTouchStart, { capture: true, passive: false });
+            renderer.domElement.addEventListener('touchmove', onTouchMove, { passive: false });
+            renderer.domElement.addEventListener('touchend', onMouseUp, false);
+            renderer.domElement.addEventListener('dragstart', (event) => event.preventDefault());
+            restartButton.addEventListener('click', resetSimulation); // Add listener for restart button
+
+            animate();
+        }
+
+        // --- Reset Function ---
+        function resetSimulation() {
+            console.log("Resetting simulation...");
+            gsap.killTweensOf(padMesh.position);
+            gsap.killTweensOf(padMesh.rotation);
+            gsap.killTweensOf(padMesh.scale); // Just in case scale was used
+            // Reset state
+            currentState = 'INITIAL';
+            targetPosition = null;
+            dragStartPoint = null;
+            currentCurveFactor = 0;
+            placedCurveFactor = 0;
+
+            // Reset pad visual state
+            padMesh.position.set(0, 10, 0); // Back to initial high position
+            padMesh.rotation.set(-Math.PI / 2, 0, 0); // Back to initial flat rotation
+            updatePadCurve(0); // Ensure geometry is flat
+
+            // Reset UI
+            infoElement.textContent = "Step 1: Click on the 'skin' surface to choose placement location.";
+            restartButton.style.display = 'none'; // Hide restart button
+            // No indicator to hide
+
+            // Reset controls
+            controls.enabled = true;
+            controls.reset(); // Reset camera position/zoom if needed
+
+            console.log("Simulation reset complete.");
+        }
+
+
+        // --- Vertex Manipulation ---
+        function updatePadCurve(factor) {
+            factor = THREE.MathUtils.clamp(factor, 0, 1);
+            const positionAttribute = padMesh.geometry.attributes.position;
+            const halfHeight = padHeight / 2;
+            for (let i = 0; i < positionAttribute.count; i++) {
+                const originalY = originalPadVertices[i * 3 + 1];
+                const normalizedY = (originalY + halfHeight) / padHeight;
+                const curveDisplacement = maxCurveHeight * factor * Math.pow(normalizedY, 2);
+                positionAttribute.setZ(i, curveDisplacement);
+            }
+            positionAttribute.needsUpdate = true;
+            padMesh.geometry.computeVertexNormals();
+            padMesh.geometry.computeBoundingSphere();
+            padMesh.geometry.computeBoundingBox();
+        }
+
+        // --- Event Handlers ---
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function getMouseIntersection(clientX, clientY) {
+            mouse.x = (clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            return raycaster.intersectObject(skinPlane);
+        }
+
+         // *** Raycaster now only needs to check padMesh ***
+         function getMousePadIntersection(clientX, clientY) {
+            mouse.x = (clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            return raycaster.intersectObject(padMesh, false); // Return array
+        }
+
+        function onClick(event) {
+            if (currentState !== 'INITIAL') return;
+            const intersects = getMouseIntersection(event.clientX, event.clientY);
+            if (intersects.length > 0) {
+                targetPosition = intersects[0].point.clone();
+                currentState = 'PLACING';
+                infoElement.textContent = 'Step 2: Placing pad...';
+                controls.enabled = false;
+                console.log("Controls DISABLED for placement.");
+                placePad();
+            }
+        }
+
+         function handleDragStart(clientX, clientY) {
+             console.log(`handleDragStart called. Current state: ${currentState}`);
+             if (currentState !== 'PLACED') return false;
+
+             const intersects = getMousePadIntersection(clientX, clientY); // Uses updated function
+             console.log(`Attempting drag start on pad. Intersects found: ${intersects.length}`);
+
+             if (intersects.length > 0) {
+                 const intersection = intersects[0];
+                 console.log(`Intersection UV.y: ${intersection.uv.y.toFixed(3)}`);
+                 // Check if click is BELOW the threshold (closer to bottom edge)
+                 if (intersection.uv && intersection.uv.y < dragStartYThreshold) { // Uses updated threshold
+                     currentState = 'ROLLING';
+                     infoElement.textContent = 'Step 3: Drag mouse/finger up/down to roll pad.';
+                     dragStartPoint = { x: clientX, y: clientY };
+                     placedCurveFactor = currentCurveFactor;
+                     // No indicator to hide
+                     console.log(`ROLLING state set (started low). Drag Start Y: ${dragStartPoint.y}, Initial factor: ${placedCurveFactor.toFixed(3)}`);
+                     return true;
+                 } else {
+                     console.log(`Drag start ignored: Clicked too high on pad (UV.y >= ${dragStartYThreshold}).`);
+                     return false; // Click was too high
+                 }
+             } else {
+                 console.log("Drag start check failed: No intersection with pad detected.");
+                 return false;
+             }
+         }
+
+        function onMouseDown(event) {
+            console.log(`onMouseDown triggered (Capture Phase). Current state: ${currentState}`);
+            if (currentState === 'PLACED') {
+                const dragStarted = handleDragStart(event.clientX, event.clientY);
+                if (dragStarted) {
+                    event.stopPropagation();
+                    console.log("Pad drag started, event propagation stopped.");
+                }
+            } else if (currentState === 'ROLLING') {
+                 controls.enabled = false;
+                 event.preventDefault();
+                 event.stopPropagation();
+            }
+        }
+
+        function handleDragMove(clientX, clientY) {
+            if (currentState !== 'ROLLING' || !dragStartPoint) return;
+            if (controls.enabled) {
+                 console.warn("Controls were unexpectedly enabled during ROLLING state!");
+                 controls.enabled = false;
+            }
+            const currentY = clientY;
+            const totalDeltaY = currentY - dragStartPoint.y;
+            const rollProgress = THREE.MathUtils.clamp(-totalDeltaY / estimatedRollDistance, 0.0, 1.0); // Uses updated estimatedRollDistance
+            const targetFactor = THREE.MathUtils.clamp(placedCurveFactor * (1.0 - rollProgress), 0.0, 1.0);
+
+            if (Math.abs(targetFactor - currentCurveFactor) > 0.001) {
+                currentCurveFactor = targetFactor;
+                updatePadCurve(currentCurveFactor);
+                const centerHeightOffset = maxCurveHeight * currentCurveFactor * 0.25;
+                padMesh.position.y = skinTouchOffsetY + centerHeightOffset;
+            }
+        }
+
+        function onMouseMove(event) {
+             if (currentState === 'ROLLING') {
+                handleDragMove(event.clientX, event.clientY);
+             }
+        }
+
+        function handleDragEnd() {
+            // Only process drag end if currently rolling
+            if (currentState === 'ROLLING') {
+                dragStartPoint = null; // Clear the start point FIRST
+
+                // Check if pad is flat enough
+                if (currentCurveFactor < flattenThreshold) {
+                    currentState = 'ROLLED';
+                    infoElement.textContent = 'Pad applied! Click Restart to try again.';
+                    controls.enabled = true; // Re-enable controls
+                    restartButton.style.display = 'inline-block'; // Show restart button
+                    // No indicator to hide
+                    console.log(`Roll finished successfully. Controls ENABLED. Final factor: ${currentCurveFactor.toFixed(3)}`);
+                } else {
+                    // Not flat enough, revert to PLACED state, keep controls disabled
+                    currentState = 'PLACED';
+                    infoElement.textContent = 'Step 3: Click lower part of pad & drag up to roll flat.';
+                    // No indicator to show
+                    // Keep controls disabled
+                    console.log(`Roll ended but not flat. State back to PLACED. Factor: ${currentCurveFactor.toFixed(3)}`);
+                }
+            }
+             else if (currentState === 'PLACED') {
+                 console.log("Mouseup in PLACED state. Controls remain disabled for Step 3.");
+                 // No indicator to show
+             }
+        }
+
+        function onMouseUp(event) {
+            console.log(`onMouseUp triggered. Current state: ${currentState}`);
+            handleDragEnd();
+        }
+
+        // --- Touch Event Handlers ---
+        function onTouchStart(event) {
+            if (event.touches.length !== 1) return;
+            const touch = event.touches[0];
+            console.log(`onTouchStart triggered (Capture Phase). Current state: ${currentState}`);
+
+            if (currentState === 'INITIAL') {
+                 const intersects = getMouseIntersection(touch.clientX, touch.clientY);
+                 if (intersects.length > 0) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    targetPosition = intersects[0].point.clone();
+                    currentState = 'PLACING';
+                    infoElement.textContent = 'Step 2: Placing pad...';
+                    controls.enabled = false;
+                    console.log("Controls DISABLED for placement (touch).");
+                    placePad();
+                }
+            } else if (currentState === 'PLACED') {
+                const dragStarted = handleDragStart(touch.clientX, touch.clientY);
+                if (dragStarted) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    console.log("Pad touch drag started, event propagation stopped.");
+                }
+            } else if (currentState === 'ROLLING') {
+                 controls.enabled = false;
+                 event.preventDefault();
+                 event.stopPropagation();
+            }
+        }
+
+        function onTouchMove(event) {
+             if (event.touches.length !== 1) return;
+             if (currentState === 'ROLLING') {
+               event.preventDefault();
+               handleDragMove(event.touches[0].clientX, event.touches[0].clientY);
+            }
+        }
+
+        // --- Simulation Logic ---
+        function placePad() {
+            if (!targetPosition) return;
+
+            // Target position for the center of the *bottom edge*
+            const targetEdgePos = targetPosition.clone();
+            // Calculate target position for the center of the mesh based on bottom edge target
+            const targetCenterPos = targetEdgePos.clone();
+            targetCenterPos.z += padHeight / 2; // Offset by half height along world Z
+
+            const duration = 1.5; // Total duration split between move and curve
+            const curveAnimation = { factor: 0 }; // Proxy object for GSAP animation
+
+            // 1. Move pad center high above the adjusted target XZ
+            gsap.to(padMesh.position, {
+                x: targetCenterPos.x,
+                y: 5, // Keep elevated during horizontal move
+                z: targetCenterPos.z,
+                duration: duration / 2, // First half of duration
+                ease: "power2.inOut",
+                onComplete: () => {
+                    // 2. Lower the pad and curve it simultaneously
+                    gsap.to(curveAnimation, {
+                        factor: 1, // Animate curve factor from 0 to 1
+                        duration: duration / 2, // Second half of duration
+                        ease: "power2.inOut",
+                        onUpdate: () => {
+                            // This function runs on every frame of the curve animation
+                            currentCurveFactor = curveAnimation.factor;
+                            updatePadCurve(currentCurveFactor);
+                            // Adjust Y position dynamically based on the *current* curve factor during animation
+                            const currentCenterHeightOffset = maxCurveHeight * currentCurveFactor * 0.25;
+                            padMesh.position.y = skinTouchOffsetY + currentCenterHeightOffset;
+                        },
+                        onComplete: () => {
+                            // Animation finished
+                            currentState = 'PLACED';
+                            currentCurveFactor = 1; // Ensure factor is exactly 1 at the end
+                            updatePadCurve(currentCurveFactor); // Final geometry update
+                            // Ensure final position is correct
+                            const finalCenterHeightOffset = maxCurveHeight * 1.0 * 0.25;
+                            padMesh.position.y = skinTouchOffsetY + finalCenterHeightOffset;
+                            infoElement.textContent = 'Step 3: Click lower part of pad & drag up to roll flat.';
+                            // No indicator logic needed here anymore
+                            // Keep controls disabled for Step 3
+                            console.log("Pad placed. State: PLACED. Controls remain DISABLED for Step 3.");
+                        }
+                    });
+                }
+            });
+        }
+
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            if (controls.enabled) {
+                 controls.update();
+            }
+            renderer.render(scene, camera);
+        }
+
+        // --- Start ---
+         window.onload = function () {
+             init();
+         }
+
+    </script>
+</body>
+</html>
